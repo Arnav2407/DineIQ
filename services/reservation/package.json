@@ -1,0 +1,14 @@
+{
+  "name": "dineiq-reservation-worker",
+  "version": "1.0.0",
+  "description": "DineIQ Reservation Expiration and No-Show worker using BullMQ",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "bullmq": "^4.6.0",
+    "dotenv": "^16.3.1",
+    "pg": "^8.11.1"
+  }
+}

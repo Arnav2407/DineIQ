@@ -1,0 +1,404 @@
+services:
+  # 1. API Gateway (Kong in DB-less mode)
+  api-gateway:
+    image: kong:alpine
+    container_name: dineiq-api-gateway
+    ports:
+      - "8000:8000"
+      - "8443:8443"
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/declarative/config.yaml
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_PROXY_LISTEN: 0.0.0.0:8000, 0.0.0.0:8443 ssl http2
+    volumes:
+      - ./infra/gateway:/usr/local/kong/declarative:z
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      audit-service:
+        condition: service_healthy
+      reservation-service:
+        condition: service_healthy
+      inventory-service:
+        condition: service_healthy
+      sales-service:
+        condition: service_healthy
+      scheduling-service:
+        condition: service_healthy
+      feedback-service:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "kong", "health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 2. Auth Service
+  auth-service:
+    build:
+      context: ./services/auth
+      dockerfile: Dockerfile
+    container_name: dineiq-auth-service
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgresql://auth_user:auth_secure_pass@db-auth:5432/dineiq_auth
+      JWT_PRIVATE_KEY_PATH: /app/keys/jwt_private.pem
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+      AUDIT_SERVICE_URL: http://audit-service:3002
+    volumes:
+      - auth-keys:/app/keys
+    depends_on:
+      db-auth:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-auth:
+    image: postgres:15-alpine
+    container_name: dineiq-db-auth
+    environment:
+      POSTGRES_USER: auth_user
+      POSTGRES_PASSWORD: auth_secure_pass
+      POSTGRES_DB: dineiq_auth
+    volumes:
+      - db-auth-data:/var/lib/postgresql/data
+      - ./services/auth/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U auth_user -d dineiq_auth" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 3. Reservation Service (M1)
+  reservation-service:
+    build:
+      context: ./services/reservation
+      dockerfile: Dockerfile
+    container_name: dineiq-reservation-service
+    ports:
+      - "3003:3003"
+    environment:
+      PORT: 3003
+      DATABASE_URL: postgresql://reservation_user:reservation_secure_pass@db-reservation:5432/dineiq_reservation
+      REDIS_URL: redis://redis:6379/0
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+    volumes:
+      - auth-keys:/app/keys:ro
+    depends_on:
+      db-reservation:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-reservation:
+    image: postgres:15-alpine
+    container_name: dineiq-db-reservation
+    environment:
+      POSTGRES_USER: reservation_user
+      POSTGRES_PASSWORD: reservation_secure_pass
+      POSTGRES_DB: dineiq_reservation
+    volumes:
+      - db-reservation-data:/var/lib/postgresql/data
+      - ./services/reservation/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U reservation_user -d dineiq_reservation" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  reservation-worker:
+    build:
+      context: ./services/reservation
+      dockerfile: Dockerfile.worker
+    container_name: dineiq-reservation-worker
+    environment:
+      DATABASE_URL: postgresql://reservation_user:reservation_secure_pass@db-reservation:5432/dineiq_reservation
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db-reservation:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - dineiq-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: dineiq-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 4. Inventory Service (M2)
+  inventory-service:
+    build:
+      context: ./services/inventory
+      dockerfile: Dockerfile
+    container_name: dineiq-inventory-service
+    ports:
+      - "3004:3004"
+    environment:
+      PORT: 3004
+      DATABASE_URL: postgresql://inventory_user:inventory_secure_pass@db-inventory:5432/dineiq_inventory
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+    volumes:
+      - auth-keys:/app/keys:z
+    depends_on:
+      db-inventory:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3004/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-inventory:
+    image: postgres:15-alpine
+    container_name: dineiq-db-inventory
+    environment:
+      POSTGRES_USER: inventory_user
+      POSTGRES_PASSWORD: inventory_secure_pass
+      POSTGRES_DB: dineiq_inventory
+    volumes:
+      - db-inventory-data:/var/lib/postgresql/data
+      - ./services/inventory/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U inventory_user -d dineiq_inventory" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 5. Sales Service (M3)
+  sales-service:
+    build:
+      context: ./services/sales
+      dockerfile: Dockerfile
+    container_name: dineiq-sales-service
+    ports:
+      - "3005:3005"
+    environment:
+      PORT: 3005
+      DATABASE_URL: postgresql://sales_user:sales_secure_pass@db-sales:5432/dineiq_sales
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+    volumes:
+      - auth-keys:/app/keys:ro
+    depends_on:
+      db-sales:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3005/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-sales:
+    image: postgres:15-alpine
+    container_name: dineiq-db-sales
+    environment:
+      POSTGRES_USER: sales_user
+      POSTGRES_PASSWORD: sales_secure_pass
+      POSTGRES_DB: dineiq_sales
+    volumes:
+      - db-sales-data:/var/lib/postgresql/data
+      - ./services/sales/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U sales_user -d dineiq_sales" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 6. Scheduling Service (M4)
+  scheduling-service:
+    build:
+      context: ./services/scheduling
+      dockerfile: Dockerfile
+    container_name: dineiq-scheduling-service
+    ports:
+      - "3006:3006"
+    environment:
+      PORT: 3006
+      DATABASE_URL: postgresql://scheduling_user:scheduling_secure_pass@db-scheduling:5432/dineiq_scheduling
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+    volumes:
+      - auth-keys:/app/keys:z
+    depends_on:
+      db-scheduling:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-scheduling:
+    image: postgres:15-alpine
+    container_name: dineiq-db-scheduling
+    environment:
+      POSTGRES_USER: scheduling_user
+      POSTGRES_PASSWORD: scheduling_secure_pass
+      POSTGRES_DB: dineiq_scheduling
+    volumes:
+      - db-scheduling-data:/var/lib/postgresql/data
+      - ./services/scheduling/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U scheduling_user -d dineiq_scheduling" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 7. Feedback Service (M5)
+  feedback-service:
+    build:
+      context: ./services/feedback
+      dockerfile: Dockerfile
+    container_name: dineiq-feedback-service
+    ports:
+      - "3007:3007"
+    environment:
+      PORT: 3007
+      DATABASE_URL: postgresql://feedback_user:feedback_secure_pass@db-feedback:5432/dineiq_feedback
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+      LLM_API_KEY: ""
+      LLM_PROVIDER: "groq"
+    volumes:
+      - auth-keys:/app/keys:z
+    depends_on:
+      db-feedback:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:3007/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-feedback:
+    image: postgres:15-alpine
+    container_name: dineiq-db-feedback
+    environment:
+      POSTGRES_USER: feedback_user
+      POSTGRES_PASSWORD: feedback_secure_pass
+      POSTGRES_DB: dineiq_feedback
+    volumes:
+      - db-feedback-data:/var/lib/postgresql/data
+      - ./services/feedback/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U feedback_user -d dineiq_feedback" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 8. Audit Log Store
+  audit-service:
+    build:
+      context: ./services/audit
+      dockerfile: Dockerfile
+    container_name: dineiq-audit-service
+    ports:
+      - "3002:3002"
+    environment:
+      PORT: 3002
+      DATABASE_URL: postgresql://audit_user:audit_secure_pass@db-audit:5432/dineiq_audit
+      JWT_PUBLIC_KEY_PATH: /app/keys/jwt_public.pem
+    volumes:
+      - auth-keys:/app/keys:z
+    depends_on:
+      db-audit:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  db-audit:
+    image: postgres:15-alpine
+    container_name: dineiq-db-audit
+    environment:
+      POSTGRES_USER: audit_user
+      POSTGRES_PASSWORD: audit_secure_pass
+      POSTGRES_DB: dineiq_audit
+    volumes:
+      - db-audit-data:/var/lib/postgresql/data
+      - ./services/audit/schema.sql:/docker-entrypoint-initdb.d/schema.sql:z
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U audit_user -d dineiq_audit" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dineiq-network
+
+  # 9. Frontend React PWA
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: dineiq-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_GATEWAY_URL=http://localhost:8000
+    networks:
+      - dineiq-network
+
+networks:
+  dineiq-network:
+    driver: bridge
+
+volumes:
+  db-auth-data:
+  db-audit-data:
+  db-reservation-data:
+  db-inventory-data:
+  db-sales-data:
+  db-scheduling-data:
+  db-feedback-data:
+  auth-keys:

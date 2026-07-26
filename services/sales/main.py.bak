@@ -1,0 +1,584 @@
+import os
+import uuid
+import csv
+import jwt
+from datetime import date, datetime, time, timedelta
+from typing import List, Optional, Dict
+from fastapi import FastAPI, Depends, HTTPException, status, Header, BackgroundTasks
+from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, func, and_, select, Numeric, Date
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.dialects.postgresql import UUID
+
+# Configs
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://sales_user:sales_secure_pass@db-sales:5432/dineiq_sales")
+PUBLIC_KEY_PATH = os.getenv("JWT_PUBLIC_KEY_PATH", "/app/keys/jwt_public.pem")
+
+# Fallback default public key
+DEFAULT_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8MwF4xCt/ddEGEyAexAC
+Z2pLbRX00NHBsu1kk5ts548oE4AIku80plwxgzcy+hLY1m1RQKQFx6Jmr/73r0YO
+0WpHC23J72r7zK1iB5A6CULC/9vR4m7TfDcqWpLh9Gl3t4y87t3W3+CT7IkDEq3Q
+VASQPhh8r+OJcJYCE0nHxayzPXIjpQhvg7/EpFHczYhCgDZkQpu7yeHixEoL0Tqg
+BugISgo2TrHhk++hq/NV/KEJ3IB0bbMas9ESxMr463W8Ci3j5TYrGtmgUsGGkWYC
+ENyyjFOklRhE13iOMe4uUQiQI10TXybKNZZIdKVL1do6sp0JMFeML+0UwlZ6yeH7
+GQIDAQAB
+-----END PUBLIC KEY-----"""
+
+# Read public key
+try:
+    if os.path.exists(PUBLIC_KEY_PATH):
+        with open(PUBLIC_KEY_PATH, "r") as f:
+            PUBLIC_KEY = f.read()
+    else:
+        PUBLIC_KEY = DEFAULT_PUBLIC_KEY
+except Exception:
+    PUBLIC_KEY = DEFAULT_PUBLIC_KEY
+
+# DB Setup
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# SQLAlchemy Models
+class MenuItem(Base):
+    __tablename__ = "menu_items"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String(50), nullable=False)
+    outlet_id = Column(String(50), nullable=False)
+    sku = Column(String(50), nullable=False)
+    name = Column(String(100), nullable=False)
+    price = Column(Numeric(12, 2), nullable=False)
+    cost = Column(Numeric(12, 2), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+class SalesTransaction(Base):
+    __tablename__ = "sales_transactions"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String(50), nullable=False)
+    outlet_id = Column(String(50), nullable=False)
+    transaction_id = Column(String(100), nullable=False)
+    menu_item_id = Column(UUID(as_uuid=True), ForeignKey("menu_items.id"), nullable=False)
+    quantity = Column(Integer, nullable=False)
+    unit_price = Column(Numeric(12, 2), nullable=False)
+    total_amount = Column(Numeric(12, 2), nullable=False)
+    meal_period = Column(String(50))
+    transaction_time = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+class POSSyncLog(Base):
+    __tablename__ = "pos_sync_log"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String(50), nullable=False)
+    outlet_id = Column(String(50), nullable=False)
+    sync_status = Column(String(50), nullable=False) # 'Success', 'Failed'
+    records_synced = Column(Integer, default=0, nullable=False)
+    error_message = Column(String, nullable=True)
+    last_sync_time = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+class SalesTrendSnapshot(Base):
+    __tablename__ = "sales_trend_snapshots"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(String(50), nullable=False)
+    outlet_id = Column(String(50), nullable=False)
+    snapshot_date = Column(Date, nullable=False)
+    total_revenue = Column(Numeric(12, 2), default=0.00, nullable=False)
+    total_orders = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+# FastAPI Init
+app = FastAPI(title="DineIQ Daily Sales & Menu Performance Dashboard API")
+
+# Dependency
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# JWT Decoder
+def verify_jwt(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token format")
+    token = authorization.split(" ")[1]
+    try:
+        payload = jwt.decode(token, PUBLIC_KEY, algorithms=["RS256"])
+        return payload
+    except jwt.PyJWTError as err:
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(err)}")
+
+# Pydantic schemas
+class MenuItemCreate(BaseModel):
+    tenant_id: str
+    outlet_id: str
+    sku: str
+    name: str
+    price: float
+    cost: float
+
+class POSSyncCSVPayload(BaseModel):
+    tenant_id: str
+    outlet_id: str
+    csv_data: str
+
+class POSSyncJSONItem(BaseModel):
+    sku: str
+    quantity: int
+    unit_price: float
+
+class POSSyncJSONTransaction(BaseModel):
+    transaction_id: str
+    transaction_time: datetime
+    items: List[POSSyncJSONItem]
+
+class POSSyncJSONPayload(BaseModel):
+    tenant_id: str
+    outlet_id: str
+    transactions: List[POSSyncJSONTransaction]
+
+# --- PLUGGABLE POS ADAPTER SYSTEM ---
+class POSAdapterInterface:
+    def parse(self, raw_payload: str) -> List[dict]:
+        raise NotImplementedError
+
+class CSVPOSAdapter(POSAdapterInterface):
+    def parse(self, csv_string: str) -> List[dict]:
+        parsed = []
+        # Expect header: transaction_id,sku,quantity,unit_price,transaction_time
+        reader = csv.DictReader(csv_string.strip().splitlines())
+        for row in reader:
+            parsed.append({
+                "transaction_id": row["transaction_id"],
+                "sku": row["sku"],
+                "quantity": int(row["quantity"]),
+                "unit_price": float(row["unit_price"]),
+                "transaction_time": datetime.fromisoformat(row["transaction_time"].replace("Z", "+00:00"))
+            })
+        return parsed
+
+class JSONPOSAdapter(POSAdapterInterface):
+    def parse_payload(self, payload: POSSyncJSONPayload) -> List[dict]:
+        parsed = []
+        for tx in payload.transactions:
+            for item in tx.items:
+                parsed.append({
+                    "transaction_id": tx.transaction_id,
+                    "sku": item.sku,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "transaction_time": tx.transaction_time
+                })
+        return parsed
+
+# Helper: Meal Period Classifier (Stamps transactions with explicit tags)
+def classify_meal_period(transaction_time: datetime) -> str:
+    # Shift configurations
+    # Breakfast: 06:00 - 11:00
+    # Lunch: 11:00 - 16:00
+    # Dinner: 16:00 - 23:00
+    # Late Night: 23:00 - 06:00
+    t = transaction_time.time()
+    if time(6, 0) <= t < time(11, 0):
+        return "Breakfast"
+    elif time(11, 0) <= t < time(16, 0):
+        return "Lunch"
+    elif time(16, 0) <= t < time(23, 0):
+        return "Dinner"
+    else:
+        return "Late Night"
+
+# Automated Meal Period Classifier (Background loop task)
+def run_background_classification_loop(db_session_factory):
+    db = db_session_factory()
+    try:
+        # Find unclassified sales records
+        unclassified = db.query(SalesTransaction).filter(SalesTransaction.meal_period == None).all()
+        for tx in unclassified:
+            tx.meal_period = classify_meal_period(tx.transaction_time)
+        db.commit()
+    except Exception as e:
+        print(f"Meal period classification job failed: {e}")
+    finally:
+        db.close()
+
+# Helper: Sync Failure Sentinel Alert System
+# Returns True if last successful POS sync was more than 30 minutes ago
+def check_sync_sentinel_alert(db: Session, tenant_id: str, outlet_id: str) -> dict:
+    last_success = db.query(POSSyncLog).filter(
+        POSSyncLog.tenant_id == tenant_id,
+        POSSyncLog.outlet_id == outlet_id,
+        POSSyncLog.sync_status == "Success"
+    ).order_by(POSSyncLog.last_sync_time.desc()).first()
+    
+    now = datetime.now(last_success.last_sync_time.tzinfo) if last_success else datetime.utcnow()
+    
+    is_offline = False
+    minutes_offline = 0
+    
+    if not last_success:
+        is_offline = True
+        minutes_offline = 9999
+    else:
+        time_diff = now - last_success.last_sync_time
+        minutes_offline = int(time_diff.total_seconds() / 60)
+        if minutes_offline > 30:
+            is_offline = True
+            
+    alert_packet = None
+    if is_offline:
+        alert_packet = {
+            "event": "SYNC_FAILURE_ALERT",
+            "tenant_id": tenant_id,
+            "outlet_id": outlet_id,
+            "last_sync_time": last_success.last_sync_time.isoformat() if last_success else None,
+            "minutes_offline": minutes_offline,
+            "severity": "CRITICAL",
+            "message": f"POS Sync connection has been offline for {minutes_offline} minutes. Action required.",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        print(f"ENQUEUED NOTIFICATION SENTINEL PACKET: {alert_packet}")
+        
+    return {
+        "sync_offline": is_offline,
+        "minutes_offline": minutes_offline,
+        "alert_packet": alert_packet
+    }
+
+# Helper: Update Sales Daily Snapshot
+def update_daily_snapshot(db: Session, tenant_id: str, outlet_id: str, trans_date: datetime.date, revenue: float):
+    snapshot = db.query(SalesTrendSnapshot).filter(
+        SalesTrendSnapshot.tenant_id == tenant_id,
+        SalesTrendSnapshot.outlet_id == outlet_id,
+        SalesTrendSnapshot.snapshot_date == trans_date
+    ).first()
+    
+    if not snapshot:
+        snapshot = SalesTrendSnapshot(
+            tenant_id=tenant_id,
+            outlet_id=outlet_id,
+            snapshot_date=trans_date,
+            total_revenue=0.00,
+            total_orders=0
+        )
+        db.add(snapshot)
+        db.flush()
+        
+    snapshot.total_revenue += float(revenue)
+    snapshot.total_orders += 1
+    db.commit()
+
+# Endpoints
+@app.get("/health")
+def health(tenant_id: Optional[str] = None, outlet_id: Optional[str] = None, db: Session = Depends(get_db)):
+    # Sentinel check returns offline indicator if active
+    sync_status = {}
+    if tenant_id and outlet_id:
+        sync_status = check_sync_sentinel_alert(db, tenant_id, outlet_id)
+        
+    return {
+        "status": "UP", 
+        "service": "sales-service",
+        "sync_sentinel": sync_status
+    }
+
+# Menu Item Creation
+@app.post("/api/v1/sales/menu-items")
+def create_menu_item(payload: MenuItemCreate, db: Session = Depends(get_db)):
+    db_item = MenuItem(
+        tenant_id=payload.tenant_id,
+        outlet_id=payload.outlet_id,
+        sku=payload.sku,
+        name=payload.name,
+        price=payload.price,
+        cost=payload.cost
+    )
+    try:
+        db.add(db_item)
+        db.commit()
+        db.refresh(db_item)
+        return db_item
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Menu Item with this SKU already exists")
+
+# --- Webhook Sync (JSON) ---
+@app.post("/api/v1/sales/pos-sync/json")
+def pos_sync_json(payload: POSSyncJSONPayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    adapter = JSONPOSAdapter()
+    try:
+        parsed_items = adapter.parse_payload(payload)
+        synced_count = 0
+        total_rev = 0.0
+        
+        # Load all menu items to resolve SKU to ID
+        menu_items_map = {m.sku: m for m in db.query(MenuItem).filter(
+            MenuItem.tenant_id == payload.tenant_id,
+            MenuItem.outlet_id == payload.outlet_id
+        ).all()}
+        
+        for item in parsed_items:
+            sku = item["sku"]
+            if sku not in menu_items_map:
+                continue # ignore unknown SKUs or skip
+                
+            db_item = menu_items_map[sku]
+            
+            # Auto meal classification
+            meal_period = classify_meal_period(item["transaction_time"])
+            
+            tx = SalesTransaction(
+                tenant_id=payload.tenant_id,
+                outlet_id=payload.outlet_id,
+                transaction_id=item["transaction_id"],
+                menu_item_id=db_item.id,
+                quantity=item["quantity"],
+                unit_price=item["unit_price"],
+                total_amount=item["quantity"] * item["unit_price"],
+                meal_period=meal_period,
+                transaction_time=item["transaction_time"]
+            )
+            db.add(tx)
+            synced_count += 1
+            total_rev += tx.total_amount
+            
+            # Update Snapshot
+            update_daily_snapshot(db, payload.tenant_id, payload.outlet_id, item["transaction_time"].date(), tx.total_amount)
+            
+        # Log success sync
+        sync_log = POSSyncLog(
+            tenant_id=payload.tenant_id,
+            outlet_id=payload.outlet_id,
+            sync_status="Success",
+            records_synced=synced_count
+        )
+        db.add(sync_log)
+        db.commit()
+        
+        return {"status": "SUCCESS", "records_synced": synced_count, "revenue_ingested": total_rev}
+        
+    except Exception as e:
+        db.rollback()
+        # Log failed sync
+        sync_log = POSSyncLog(
+            tenant_id=payload.tenant_id,
+            outlet_id=payload.outlet_id,
+            sync_status="Failed",
+            records_synced=0,
+            error_message=str(e)
+        )
+        db.add(sync_log)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
+
+# --- CSV Import Sync ---
+@app.post("/api/v1/sales/pos-sync/csv")
+def pos_sync_csv(payload: POSSyncCSVPayload, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    adapter = CSVPOSAdapter()
+    try:
+        parsed_items = adapter.parse(payload.csv_data)
+        synced_count = 0
+        total_rev = 0.0
+        
+        # Resolve menu items
+        menu_items_map = {m.sku: m for m in db.query(MenuItem).filter(
+            MenuItem.tenant_id == payload.tenant_id,
+            MenuItem.outlet_id == payload.outlet_id
+        ).all()}
+        
+        for item in parsed_items:
+            sku = item["sku"]
+            if sku not in menu_items_map:
+                continue
+                
+            db_item = menu_items_map[sku]
+            
+            meal_period = classify_meal_period(item["transaction_time"])
+            
+            tx = SalesTransaction(
+                tenant_id=payload.tenant_id,
+                outlet_id=payload.outlet_id,
+                transaction_id=item["transaction_id"],
+                menu_item_id=db_item.id,
+                quantity=item["quantity"],
+                unit_price=item["unit_price"],
+                total_amount=item["quantity"] * item["unit_price"],
+                meal_period=meal_period,
+                transaction_time=item["transaction_time"]
+            )
+            db.add(tx)
+            synced_count += 1
+            total_rev += tx.total_amount
+            
+            update_daily_snapshot(db, payload.tenant_id, payload.outlet_id, item["transaction_time"].date(), tx.total_amount)
+            
+        sync_log = POSSyncLog(
+            tenant_id=payload.tenant_id,
+            outlet_id=payload.outlet_id,
+            sync_status="Success",
+            records_synced=synced_count
+        )
+        db.add(sync_log)
+        db.commit()
+        
+        return {"status": "SUCCESS", "records_synced": synced_count, "revenue_ingested": total_rev}
+        
+    except Exception as e:
+        db.rollback()
+        sync_log = POSSyncLog(
+            tenant_id=payload.tenant_id,
+            outlet_id=payload.outlet_id,
+            sync_status="Failed",
+            records_synced=0,
+            error_message=str(e)
+        )
+        db.add(sync_log)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Sync failed: {str(e)}")
+
+# --- GET /api/v1/sales/items (Aggregated performance) ---
+@app.get("/api/v1/sales/items")
+def get_sales_items(
+    tenant_id: str,
+    outlet_id: str,
+    start_date: date,
+    end_date: date,
+    db: Session = Depends(get_db),
+    user: dict = Depends(verify_jwt) # Adds verification gate
+):
+    # Enforce Sync Sentinel alerts injection into response header for UI warning banners
+    sentinel = check_sync_sentinel_alert(db, tenant_id, outlet_id)
+    
+    # Query aggregates
+    query = db.query(
+        MenuItem.sku,
+        MenuItem.name,
+        func.sum(SalesTransaction.quantity).label("qty_sold"),
+        func.sum(SalesTransaction.total_amount).label("revenue"),
+        func.sum(SalesTransaction.quantity * MenuItem.cost).label("cogs")
+    ).join(MenuItem, SalesTransaction.menu_item_id == MenuItem.id).filter(
+        SalesTransaction.tenant_id == tenant_id,
+        SalesTransaction.outlet_id == outlet_id,
+        SalesTransaction.transaction_time >= start_date,
+        SalesTransaction.transaction_time <= end_date
+    ).group_by(MenuItem.sku, MenuItem.name).all()
+    
+    results = []
+    for sku, name, qty, rev, cogs in query:
+        revenue = float(rev)
+        cost_of_goods = float(cogs)
+        contribution_margin = revenue - cost_of_goods
+        margin_pct = (contribution_margin / revenue * 100) if revenue > 0 else 0.0
+        
+        results.append({
+            "sku": sku,
+            "name": name,
+            "quantity_sold": int(qty),
+            "revenue": revenue,
+            "contribution_margin": contribution_margin,
+            "contribution_margin_percentage": margin_pct
+        })
+        
+    # Return metrics + sentinel warning headers for frontend enforcement
+    return {
+        "items": results,
+        "sync_sentinel_alert": sentinel["sync_offline"],
+        "sync_alert_packet": sentinel["alert_packet"]
+    }
+
+# --- GET /api/v1/sales/performers (Ranking menu items) ---
+@app.get("/api/v1/sales/performers")
+def get_menu_performers(
+    tenant_id: str,
+    outlet_id: str,
+    start_date: datetime,
+    end_date: datetime,
+    db: Session = Depends(get_db)
+):
+    query = db.query(
+        MenuItem.name,
+        func.sum(SalesTransaction.quantity).label("qty_sold")
+    ).join(MenuItem, SalesTransaction.menu_item_id == MenuItem.id).filter(
+        SalesTransaction.tenant_id == tenant_id,
+        SalesTransaction.outlet_id == outlet_id,
+        SalesTransaction.transaction_time >= start_date,
+        SalesTransaction.transaction_time <= end_date
+    ).group_by(MenuItem.name).order_by(func.sum(SalesTransaction.quantity).desc()).all()
+    
+    top_5 = [{"name": name, "quantity_sold": int(qty)} for name, qty in query[:5]]
+    # Bottom 5 (requires reverse sorting of items with sales)
+    bottom_5 = [{"name": name, "quantity_sold": int(qty)} for name, qty in reversed(query[-5:])]
+    
+    return {
+        "top_5": top_5,
+        "bottom_5": bottom_5
+    }
+
+# --- GET /api/v1/sales/trends (DoD, WoW, MoM comparison) ---
+@app.get("/api/v1/sales/trends")
+def get_sales_trends(
+    tenant_id: str,
+    outlet_id: str,
+    target_date: datetime.date,
+    db: Session = Depends(get_db)
+):
+    # Fetch target date revenue
+    target_rev = db.query(func.coalesce(func.sum(SalesTrendSnapshot.total_revenue), 0)).filter(
+        SalesTrendSnapshot.tenant_id == tenant_id,
+        SalesTrendSnapshot.outlet_id == outlet_id,
+        SalesTrendSnapshot.snapshot_date == target_date
+    ).scalar()
+    
+    # DoD (Yesterday)
+    yesterday = target_date - timedelta(days=1)
+    dod_rev = db.query(func.coalesce(func.sum(SalesTrendSnapshot.total_revenue), 0)).filter(
+        SalesTrendSnapshot.tenant_id == tenant_id,
+        SalesTrendSnapshot.outlet_id == outlet_id,
+        SalesTrendSnapshot.snapshot_date == yesterday
+    ).scalar()
+    
+    # WoW (Last week same day)
+    last_week = target_date - timedelta(days=7)
+    wow_rev = db.query(func.coalesce(func.sum(SalesTrendSnapshot.total_revenue), 0)).filter(
+        SalesTrendSnapshot.tenant_id == tenant_id,
+        SalesTrendSnapshot.outlet_id == outlet_id,
+        SalesTrendSnapshot.snapshot_date == last_week
+    ).scalar()
+    
+    # MoM (Last month same day - approx 30 days)
+    last_month = target_date - timedelta(days=30)
+    mom_rev = db.query(func.coalesce(func.sum(SalesTrendSnapshot.total_revenue), 0)).filter(
+        SalesTrendSnapshot.tenant_id == tenant_id,
+        SalesTrendSnapshot.outlet_id == outlet_id,
+        SalesTrendSnapshot.snapshot_date == last_month
+    ).scalar()
+
+    target_rev = float(target_rev)
+    dod_rev = float(dod_rev)
+    wow_rev = float(wow_rev)
+    mom_rev = float(mom_rev)
+
+    # Computes percentage growth
+    dod_growth = ((target_rev - dod_rev) / dod_rev * 100) if dod_rev > 0 else 0.0
+    wow_growth = ((target_rev - wow_rev) / wow_rev * 100) if wow_rev > 0 else 0.0
+    mom_growth = ((target_rev - mom_rev) / mom_rev * 100) if mom_rev > 0 else 0.0
+
+    return {
+        "date": target_date.isoformat(),
+        "revenue": target_rev,
+        "comparisons": {
+            "day_over_day": {
+                "previous_revenue": dod_rev,
+                "growth_percentage": dod_growth
+            },
+            "week_over_week": {
+                "previous_revenue": wow_rev,
+                "growth_percentage": wow_growth
+            },
+            "month_over_month": {
+                "previous_revenue": mom_rev,
+                "growth_percentage": mom_growth
+            }
+        }
+    }

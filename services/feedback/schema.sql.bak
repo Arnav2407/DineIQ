@@ -1,0 +1,81 @@
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Drop tables if they exist
+DROP TABLE IF EXISTS alert_log CASCADE;
+DROP TABLE IF EXISTS satisfaction_snapshots CASCADE;
+DROP TABLE IF EXISTS review_themes CASCADE;
+DROP TABLE IF EXISTS reviews CASCADE;
+
+-- 1. Reviews
+CREATE TABLE reviews (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id VARCHAR(50) NOT NULL,
+    outlet_id VARCHAR(50) NOT NULL,
+    platform VARCHAR(50) NOT NULL CHECK (platform IN ('Google', 'Zomato', 'Swiggy')),
+    platform_review_id VARCHAR(255) NOT NULL, -- Platform-provided review ID for deduplication
+    rating NUMERIC(3, 2) NOT NULL CHECK (rating >= 1.00 AND rating <= 5.00),
+    review_text TEXT,
+    sentiment VARCHAR(50) DEFAULT 'NEUTRAL' NOT NULL CHECK (sentiment IN ('POSITIVE', 'NEUTRAL', 'NEGATIVE')),
+    triage_status VARCHAR(50) DEFAULT 'PENDING' NOT NULL CHECK (triage_status IN ('PENDING', 'PROCESSED', 'FAILED')),
+    review_date TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    UNIQUE (tenant_id, platform, platform_review_id)
+);
+
+-- 2. Review Themes
+CREATE TABLE review_themes (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    review_id UUID NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+    theme VARCHAR(100) NOT NULL CHECK (theme IN ('FOOD_QUALITY', 'SERVICE_SPEED', 'CLEANLINESS', 'VALUE_FOR_MONEY', 'STAFF_BEHAVIOR', 'AMBIENCE')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+-- 3. Satisfaction Snapshots
+CREATE TABLE satisfaction_snapshots (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id VARCHAR(50) NOT NULL,
+    outlet_id VARCHAR(50) NOT NULL,
+    snapshot_date DATE NOT NULL,
+    average_score NUMERIC(4, 2) DEFAULT 0.00 NOT NULL,
+    total_reviews INT DEFAULT 0 NOT NULL,
+    positive_count INT DEFAULT 0 NOT NULL,
+    neutral_count INT DEFAULT 0 NOT NULL,
+    negative_count INT DEFAULT 0 NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    UNIQUE (tenant_id, outlet_id, snapshot_date)
+);
+
+-- 4. Alert Log (for negative reviews spikes tracking and cooldown)
+CREATE TABLE alert_log (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id VARCHAR(50) NOT NULL,
+    outlet_id VARCHAR(50) NOT NULL,
+    alert_type VARCHAR(100) NOT NULL, -- 'NEGATIVE_SPIKE'
+    message TEXT NOT NULL,
+    triggered_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    cooldown_until TIMESTAMP WITH TIME ZONE NOT NULL
+);
+
+-- Indexes for performance and multi-tenancy constraints
+CREATE INDEX idx_reviews_dedup ON reviews(tenant_id, platform, platform_review_id);
+CREATE INDEX idx_reviews_filter ON reviews(tenant_id, outlet_id, review_date DESC, sentiment);
+CREATE INDEX idx_review_themes_ref ON review_themes(review_id);
+CREATE INDEX idx_satisfaction_snap_date ON satisfaction_snapshots(tenant_id, outlet_id, snapshot_date DESC);
+CREATE INDEX idx_alert_log_cooldown ON alert_log(tenant_id, outlet_id, cooldown_until DESC);
+
+-- Seed initial reviews for testing
+INSERT INTO reviews (id, tenant_id, outlet_id, platform, platform_review_id, rating, review_text, sentiment, triage_status, review_date) VALUES
+    ('g0000000-0000-0000-0000-000000000001', 'tenant-hq-1', 'outlet-bistro-1', 'Google', 'review-g-1', 5.00, 'Excellent Wagyu steak, fast service and clean patio!', 'POSITIVE', 'PROCESSED', '2026-07-12 10:00:00+00'),
+    ('g0000000-0000-0000-0000-000000000002', 'tenant-hq-1', 'outlet-bistro-1', 'Zomato', 'review-z-1', 2.00, 'The Cheeseburger was cold, and service took 45 minutes.', 'NEGATIVE', 'PROCESSED', '2026-07-12 11:30:00+00'),
+    ('g0000000-0000-0000-0000-000000000003', 'tenant-hq-1', 'outlet-bistro-1', 'Swiggy', 'review-s-1', 4.00, 'Good salad and espresso. Quick delivery.', 'POSITIVE', 'PROCESSED', '2026-07-12 12:15:00+00');
+
+-- Seed themes associated with the seeded reviews
+INSERT INTO review_themes (review_id, theme) VALUES
+    ('g0000000-0000-0000-0000-000000000001', 'FOOD_QUALITY'),
+    ('g0000000-0000-0000-0000-000000000001', 'SERVICE_SPEED'),
+    ('g0000000-0000-0000-0000-000000000001', 'CLEANLINESS'),
+    ('g0000000-0000-0000-0000-000000000002', 'FOOD_QUALITY'),
+    ('g0000000-0000-0000-0000-000000000002', 'SERVICE_SPEED'),
+    ('g0000000-0000-0000-0000-000000000003', 'FOOD_QUALITY'),
+    ('g0000000-0000-0000-0000-000000000003', 'SERVICE_SPEED');

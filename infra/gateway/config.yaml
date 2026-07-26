@@ -1,0 +1,82 @@
+_format_version: "3.0"
+_transform: true
+
+services:
+  - name: auth-service
+    url: http://auth-service:3001
+    routes:
+      - name: auth-route
+        paths:
+          - /api/v1/auth
+        strip_path: true
+        plugins:
+          - name: cors
+            config:
+              origins:
+                - "http://localhost:5173"
+              credentials: true
+              max_age: 3600
+
+  - name: reservation-service
+    url: http://reservation-service:3003
+    routes:
+      - name: reservation-route
+        paths:
+          - /api/v1/tables
+          - /api/v1/reservations
+          - /api/v1/waitlist
+          - /api/v1/analytics/reservations
+          - /api/v1/reservation-portal
+        strip_path: false
+
+  - name: inventory-service
+    url: http://inventory-service:3004
+    routes:
+      - name: inventory-route
+        paths:
+          - /api/v1/inventory
+        strip_path: false
+
+  - name: sales-service
+    url: http://sales-service:3005
+    routes:
+      - name: sales-route
+        paths:
+          - /api/v1/sales
+        strip_path: false
+
+  - name: scheduling-service
+    url: http://scheduling-service:3006
+    routes:
+      - name: scheduling-route
+        paths:
+          - /api/v1/scheduling
+          - /api/v1/rosters
+          - /api/v1/attendance
+          - /api/v1/leave-requests
+          - /api/v1/payroll
+        strip_path: false
+
+  - name: feedback-service
+    url: http://feedback-service:3007
+    routes:
+      - name: feedback-route
+        paths:
+          - /api/v1/feedback
+        strip_path: false
+
+  - name: audit-service
+    url: http://audit-service:3002
+    routes:
+      - name: audit-route
+        paths:
+          - /api/v1/admin/audit-log
+        strip_path: false
+
+plugins:
+  - name: cors
+    config:
+      origins:
+        - "http://localhost:5173"
+      credentials: true
+      max_age: 3600
